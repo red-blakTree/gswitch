@@ -225,7 +225,7 @@ impl Detector {
     /// 读取 sysfs 属性，失败时记录 debug 日志
     fn read_sysfs_attr(dev_path: &Path, attr: &str) -> String {
         match fs::read_to_string(dev_path.join(attr)) {
-            Ok(s) => s,
+            Ok(s) => s.trim().to_string(),
             Err(e) => {
                 debug!("读取 sysfs {}/{} 失败: {}", dev_path.display(), attr, e);
                 String::new()
