@@ -1,0 +1,205 @@
+# gswitch 自动打包工作流
+#
+# 触发方式：
+#   1. 推送 git tag（如 v0.1.0）→ 自动构建并发布正式 Release
+#   2. 手动触发（workflow_dispatch）→ 自动构建并发布 Release（tag 从 Cargo.toml 版本生成）
+#
+# 构建产物：
+#   - .deb（Debian/Ubuntu）
+#   - .rpm（Fedora/RHEL）
+#   - .pkg.tar.zst（Arch Linux）
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  detect-version:
+    name: Detect version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      tag: ${{ steps.get-tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from Cargo.toml
+        id: get-version
+        run: |
+          VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'\"' -f2)"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine tag name
+        id: get-tag
+        run: |
+          if [ -n "${{ github.ref_type }}" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="v${{ steps.get-version.outputs.version }}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+  build-deb:
+    name: Build .deb
+    needs: [detect-version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build .deb package
+        run: cargo deb
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gswitch-deb
+          path: target/debian/*.deb
+
+  build-rpm:
+    name: Build .rpm
+    needs: [detect-version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install RPM build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      - name: Install cargo-generate-rpm
+        run: cargo install cargo-generate-rpm --locked
+
+      - name: Build .rpm package
+        run: cargo generate-rpm
+
+      - name: Upload .rpm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gswitch-rpm
+          path: target/generate-rpm/*.rpm
+
+  build-arch:
+    name: Build .pkg.tar.zst
+    needs: [detect-version]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare Arch package structure
+        run: |
+          set -e
+          PKGVER="${{ needs.detect-version.outputs.version }}"
+          PKGNAME="gswitch"
+          PKGDIR="${PKGNAME}-${PKGVER}"
+
+          mkdir -p "${PKGDIR}/usr/bin"
+          mkdir -p "${PKGDIR}/usr/share/bash-completion/completions"
+          mkdir -p "${PKGDIR}/usr/share/fish/vendor_completions.d"
+          mkdir -p "${PKGDIR}/usr/share/licenses/${PKGNAME}"
+
+          cp target/release/gswitch "${PKGDIR}/usr/bin/"
+          cp completions/gswitch.bash "${PKGDIR}/usr/share/bash-completion/completions/gswitch"
+          cp completions/gswitch.fish "${PKGDIR}/usr/share/fish/vendor_completions.d/gswitch.fish"
+          cp LICENSE "${PKGDIR}/usr/share/licenses/${PKGNAME}/"
+
+          # 生成 .PKGINFO（Arch Linux 包元数据）
+          cat > "${PKGDIR}/.PKGINFO" <<- PKGINFO
+          pkgname = ${PKGNAME}
+          pkgver = ${PKGVER}
+          pkgdesc = GPU switching utility for NVIDIA Optimus laptops
+          url = https://github.com/red-blakTree/gswitch
+          builddate = $(date +%s)
+          packager = GitHub Actions
+          size = $(stat -c%s target/release/gswitch)
+          arch = x86_64
+          license = GPL-3.0-or-later
+          PKGINFO
+
+          # 打包为 .tar.zst
+          tar --zstd -cf "${PKGNAME}-${PKGVER}-x86_64.pkg.tar.zst" "${PKGDIR}"
+
+      - name: Upload .pkg.tar.zst artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gswitch-arch
+          path: ./*.pkg.tar.zst
+
+  create-release:
+    name: Publish Release
+    needs: [detect-version, build-deb, build-rpm, build-arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.detect-version.outputs.tag }}
+          name: gswitch ${{ needs.detect-version.outputs.tag }}
+          body: |
+            ## gswitch ${{ needs.detect-version.outputs.tag }}
+
+            此版本包含以下软件包：
+
+            | 格式 | 文件 |
+            |------|------|
+            | .deb (Debian/Ubuntu) | `gswitch-*.deb` |
+            | .rpm (Fedora/RHEL) | `gswitch-*.rpm` |
+            | .pkg.tar.zst (Arch Linux) | `gswitch-*.pkg.tar.zst` |
+
+            ### 安装方式
+
+            **Debian/Ubuntu:**
+            ```
+            sudo dpkg -i gswitch-*.deb
+            ```
+
+            **Fedora/RHEL:**
+            ```
+            sudo rpm -i gswitch-*.rpm
+            ```
+
+            **Arch Linux:**
+            ```
+            sudo pacman -U gswitch-*.pkg.tar.zst
+            ```
+
+            详情请参阅 [README](https://github.com/red-blakTree/gswitch#readme)。
+          files: |
+            artifacts/gswitch-deb/*.deb
+            artifacts/gswitch-rpm/*.rpm
+            artifacts/gswitch-arch/*.pkg.tar.zst
+          fail_on_unmatched_files: true

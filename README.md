@@ -338,4 +338,4 @@ cargo build --release
 
 ## 许可证
 
-GPL-3.0
+GPL-3.0-only

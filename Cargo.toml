@@ -17,6 +17,31 @@ thiserror = "2.0"
 [dev-dependencies]
 tempfile = "3"
 
+# ====== 打包配置 ======
+
+# cargo-deb (.deb 包)
+[package.metadata.deb]
+section = "utils"
+priority = "optional"
+maintainer = "gswitch contributors"
+copyright = "GPL-3.0-or-later"
+depends = "$auto"
+assets = [
+    ["target/release/gswitch", "/usr/bin/gswitch", "755"],
+    ["completions/gswitch.bash", "/usr/share/bash-completion/completions/gswitch", "644"],
+    ["completions/gswitch.fish", "/usr/share/fish/vendor_completions.d/gswitch.fish", "644"],
+    ["LICENSE", "/usr/share/doc/gswitch/copyright", "644"],
+]
+
+# cargo-generate-rpm (.rpm 包)
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/gswitch", dest = "/usr/bin/gswitch", mode = "755" },
+    { source = "completions/gswitch.bash", dest = "/usr/share/bash-completion/completions/gswitch", mode = "644" },
+    { source = "completions/gswitch.fish", dest = "/usr/share/fish/vendor_completions.d/gswitch.fish", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/gswitch/LICENSE", mode = "644" },
+]
+
 [lints.clippy]
 match_like_matches_macro = "allow"
 match_same_arms = "allow"
