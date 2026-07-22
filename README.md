@@ -31,7 +31,7 @@
 |------|-----------|------|---------|
 | `integrated` | `gswitch integrated` | 仅集成显卡，将 NVIDIA 加入黑名单，udev 移除非显示设备 | 最大省电（不插电、开发者） |
 | `hybrid` | `gswitch hybrid [--rtd3 <0-3>]` | PRIME 混合模式，按需卸载渲染，支持 RTD3 运行时电源管理 | 日常使用（兼顾续航与性能） |
-| `nvidia` | `gswitch nvidia` | NVIDIA 独立显卡始终在线，写入 X11 PrimaryGPU 配置 | 外接显示器、游戏、渲染 |
+| `nvidia` | `gswitch nvidia` | ⚠️ **伪独显模式**：通过 `__NV_PRIME_RENDER_OFFLOAD=1` 等环境变量强制应用渲染在 NVIDIA 显卡上，并非真正的独显切换。部分应用（如某些 Wayland 程序、Electron 应用）可能无法正确渲染。如有更好的强制渲染方案，请提交 Issue。 | 外接显示器、游戏、渲染（兼容性有限） |
 | `passthrough` | `gswitch passthrough` | NVIDIA 绑定到 vfio-pci 驱动，直通给虚拟机 | 虚拟机 GPU 直通（VFIO） |
 
 ---
@@ -104,7 +104,7 @@ sudo gswitch hybrid
 # 混合模式 + RTD3 运行时电源管理（0=禁用，1-3=启用级别）
 sudo gswitch hybrid --rtd3 2
 
-# NVIDIA 独立显卡模式 — 独显始终在线
+# ⚠️ NVIDIA 渲染优先模式 — 通过环境变量强制渲染在 NVIDIA 显卡上
 sudo gswitch nvidia
 
 # VFIO 直通模式 — GPU 直通给虚拟机
@@ -204,7 +204,17 @@ sudo gswitch reset
 
 ## 工作原理
 
-gswitch 通过修改系统配置文件 + 重建 initramfs 实现 GPU 模式切换。核心流程：
+gswitch 通过修改系统配置文件 + 重建 initramfs 实现 GPU 模式切换。
+
+> **关于 nvidia 模式的说明：** 该模式并非真正的"独显切换"（即完全由 NVIDIA 显卡接管显示输出），而是通过设置 `__NV_PRIME_RENDER_OFFLOAD=1`、`DRI_PRIME=1` 等环境变量，配合 X11 PrimaryGPU 配置，**请求**应用在 NVIDIA 显卡上渲染。
+> - 并非所有应用都遵循这些环境变量
+> - Wayland 环境下部分应用不受 `__NV_PRIME_RENDER_OFFLOAD` 控制
+> - Electron/Chromium 类应用可能存在渲染异常
+> - 真正的独显模式需要 BIOS MUX 硬件支持或 NVIDIA 驱动的 Dynamic Boost 机制
+>
+> 如果你有其他方法能在不使用环境变量的情况下强制应用渲染在 NVIDIA 显卡上，欢迎提交 Issue。
+
+核心流程：
 
 ```
 用户请求切换
@@ -241,7 +251,7 @@ gswitch 通过修改系统配置文件 + 重建 initramfs 实现 GPU 模式切�
 |------|----------|------|------|
 | **Integrated** | 黑名单 `nvidia` / `nouveau`，install 拦截 | 移除 NVIDIA 设备（音频、USB、VGA） | 删除 modeset 配置 |
 | **Hybrid** | 空（允许所有驱动） | 运行时 PM 规则（bind → auto, unbind → on） | 写入 modeset 配置（含可选 RTD3） |
-| **Nvidia** | 空 | — | 写入 modeset、X11 PrimaryGPU、环境变量、启用 nvidia-fallback |
+| **Nvidia** | 空 | — | 写入 modeset、X11 PrimaryGPU、环境变量 `__NV_PRIME_RENDER_OFFLOAD=1` 等、启用 nvidia-fallback |
 | **Passthrough** | 黑名单 + vfio-pci ids= 绑定 | — | 添加 vfio_pci 到 initramfs 模块 |
 
 ### 原子性与回滚
