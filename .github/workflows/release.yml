@@ -33,7 +33,7 @@ jobs:
       - name: Extract version from Cargo.toml
         id: get-version
         run: |
-          VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'\"' -f2)"
+          VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Determine tag name
