@@ -1,6 +1,6 @@
 //! 通过 sysfs 检测 GPU 硬件
 
-use crate::config::*;
+use crate::config::{self, *};
 use crate::error::GswitchError;
 use crate::graphics::GraphicsMode;
 use log::{debug, info, warn};
@@ -14,6 +14,12 @@ struct PciEntry {
     name: String,
     path: PathBuf,
 }
+
+/// 不可切换的 DMI chassis type（台式机/服务器等固定设备）
+/// 参考 Desktop Management Interface (DMI) Specification
+/// - 3=Desktop, 4=Low Profile Desktop, 5=Pizza Box
+/// - 6=Mini Tower, 7=Tower, 17=Main Server Chassis, 23=Blade Server
+pub const NON_SWITCHABLE_CHASSIS_TYPES: &[u32] = &[3, 4, 5, 6, 7, 17, 23];
 
 /// 系统休眠模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,11 +71,12 @@ pub struct Detector;
 impl Detector {
     /// 列出 /sys/bus/pci/devices 下所有 PCI 设备条目
     fn list_pci_entries() -> Result<Vec<PciEntry>, GswitchError> {
-        let pci_path = Path::new("/sys/bus/pci/devices");
+        let pci_path_str = config::resolve_path("/sys/bus/pci/devices");
+        let pci_path = Path::new(&pci_path_str);
         if !pci_path.is_dir() {
-            return Err(GswitchError::Gpu(
-                "/sys/bus/pci/devices 不存在".into(),
-            ));
+            return Err(GswitchError::Gpu(format!(
+                "{} 不存在", pci_path_str
+            )));
         }
         let entries: Vec<PciEntry> = fs::read_dir(pci_path)
             .map_err(|e| GswitchError::Gpu(format!("读取 PCI 目录失败: {}", e)))?
@@ -128,12 +135,13 @@ impl Detector {
 
     /// 检查系统是否支持 GPU 切换
     pub fn can_switch() -> Result<bool, GswitchError> {
-        let chassis = fs::read_to_string("/sys/class/dmi/id/chassis_type").unwrap_or_default();
+        let chassis = fs::read_to_string(config::resolve_path(
+            "/sys/class/dmi/id/chassis_type",
+        ))
+        .unwrap_or_default();
         let chassis_type: u32 = chassis.trim().parse().unwrap_or(0);
-        // DMI chassis type 参考：3=Desktop, 4=Low Profile Desktop, 5=Pizza Box,
-        // 6=Mini Tower, 7=Tower, 17=Main Server Chassis, 23=Blade Server 等
-        // 这些通常是不可切换的固定设备；笔记本（8/9/10/14/31/32）允许通过
-        let is_desktop_or_server = matches!(chassis_type, 3 | 4 | 5 | 6 | 7 | 17 | 23);
+        let is_desktop_or_server =
+            NON_SWITCHABLE_CHASSIS_TYPES.contains(&chassis_type);
         if chassis_type != 0 && is_desktop_or_server {
             debug!("检测到非笔记本机型 (chassis_type={})，不可切换", chassis_type);
             return Ok(false);
@@ -160,7 +168,8 @@ impl Detector {
 
     /// 通过检查内核模块和配置文件查询当前 GPU 模式
     pub fn query_current_mode() -> GraphicsMode {
-        let modules = fs::read_to_string("/proc/modules").unwrap_or_default();
+        let modules =
+            fs::read_to_string(config::resolve_path("/proc/modules")).unwrap_or_default();
 
         let nvidia_loaded = modules.lines().any(|line| {
             let name = line.split_whitespace().next().unwrap_or("");
@@ -276,7 +285,8 @@ impl Detector {
 
     /// 检测系统休眠模式：S0ix (s2idle) vs S3 (deep)
     pub fn detect_sleep_mode() -> SleepMode {
-        let mem_sleep = fs::read_to_string("/sys/power/mem_sleep").unwrap_or_default();
+        let mem_sleep = fs::read_to_string(config::resolve_path("/sys/power/mem_sleep"))
+            .unwrap_or_default();
         if mem_sleep.contains("[s2idle]") {
             return SleepMode::S0ix;
         }
@@ -393,7 +403,7 @@ impl Detector {
     /// 获取 DMI 厂商字符串
     #[allow(dead_code)]
     pub fn get_vendor() -> String {
-        fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+        fs::read_to_string(config::resolve_path("/sys/class/dmi/id/sys_vendor"))
             .unwrap_or_default()
             .trim()
             .to_string()
@@ -401,7 +411,7 @@ impl Detector {
 
     /// 获取 DMI 产品版本字符串
     pub fn get_product() -> String {
-        fs::read_to_string("/sys/class/dmi/id/product_version")
+        fs::read_to_string(config::resolve_path("/sys/class/dmi/id/product_version"))
             .unwrap_or_default()
             .trim()
             .to_string()
@@ -415,9 +425,7 @@ impl Detector {
             return Err(GswitchError::Gpu("系统不支持 GPU 切换".into()));
         }
 
-        let model = fs::read_to_string("/sys/class/dmi/id/product_version")
-            .map_err(|e| GswitchError::Gpu(format!("读取 product_version 失败: {e}")))?;
-        let model = model.trim().to_lowercase();
+        let model = Self::get_product().to_lowercase();
 
         Ok(EXTERNAL_DISPLAY_REQUIRES_NVIDIA
             .iter()
@@ -455,21 +463,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_sleep_mode_detection_from_string() {
-        // 模拟 /sys/power/mem_sleep 输出
-        let s2idle = "s2idle [deep]";
-        assert!(!s2idle.contains("[s2idle]"));
-        assert!(s2idle.contains("[deep]"));
+    fn test_detect_sleep_mode_s2idle() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = dir.path().to_str().unwrap().to_string();
 
-        let deep = "[s2idle] deep";
-        assert!(deep.contains("[s2idle]"));
+        // 创建模拟的 /sys/power/mem_sleep（默认 s2idle）
+        let sysfs_path = Path::new(&root).join("sys/power");
+        std::fs::create_dir_all(&sysfs_path).expect("创建 sysfs 目录");
+        std::fs::write(sysfs_path.join("mem_sleep"), "[s2idle] deep").expect("写入 mem_sleep");
 
-        let only_s2idle = "[s2idle]";
-        assert!(only_s2idle.contains("[s2idle]"));
+        config::set_root_for_test(&root);
+        assert_eq!(Detector::detect_sleep_mode(), SleepMode::S0ix);
+        config::clear_root_for_test();
+    }
 
-        let only_deep = "[deep]";
-        assert!(!only_deep.contains("[s2idle]"));
-        assert!(only_deep.contains("[deep]"));
+    #[test]
+    fn test_detect_sleep_mode_s3() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = dir.path().to_str().unwrap().to_string();
+
+        let sysfs_path = Path::new(&root).join("sys/power");
+        std::fs::create_dir_all(&sysfs_path).expect("创建 sysfs 目录");
+        std::fs::write(sysfs_path.join("mem_sleep"), "s2idle [deep]").expect("写入 mem_sleep");
+
+        config::set_root_for_test(&root);
+        assert_eq!(Detector::detect_sleep_mode(), SleepMode::S3);
+        config::clear_root_for_test();
+    }
+
+    #[test]
+    fn test_detect_sleep_mode_unknown() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = dir.path().to_str().unwrap().to_string();
+
+        // 不创建 mem_sleep 文件 → Unknown
+        config::set_root_for_test(&root);
+        assert_eq!(Detector::detect_sleep_mode(), SleepMode::Unknown);
+        config::clear_root_for_test();
+    }
+
+    #[test]
+    fn test_detect_sleep_mode_no_brackets() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let root = dir.path().to_str().unwrap().to_string();
+
+        // 无方括号但内容存在 → 根据内容推断
+        let sysfs_path = Path::new(&root).join("sys/power");
+        std::fs::create_dir_all(&sysfs_path).expect("创建 sysfs 目录");
+        std::fs::write(sysfs_path.join("mem_sleep"), "s2idle deep").expect("写入 mem_sleep");
+
+        config::set_root_for_test(&root);
+        assert_eq!(Detector::detect_sleep_mode(), SleepMode::S0ix);
+        config::clear_root_for_test();
     }
 
     #[test]

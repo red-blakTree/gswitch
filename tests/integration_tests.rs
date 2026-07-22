@@ -325,3 +325,196 @@ fn test_switch_passthrough_writes_vfio_modprobe() {
     assert!(content.contains("options vfio-pci ids="));
     assert!(content.contains("blacklist nvidia"));
 }
+
+// ====== 检测器核心函数测试 ======
+
+/// 在测试根下创建模拟的 sysfs PCI 设备目录
+fn create_sysfs_pci_device(root: &TestRoot, pci_addr: &str, vendor: &str, device: &str, class: &str) {
+    let dev_path = root.path().join(format!("sys/bus/pci/devices/{pci_addr}"));
+    fs::create_dir_all(&dev_path).expect("create pci device dir");
+    fs::write(dev_path.join("vendor"), format!("{vendor}\n")).expect("write vendor");
+    fs::write(dev_path.join("device"), format!("{device}\n")).expect("write device");
+    fs::write(dev_path.join("class"), format!("{class}\n")).expect("write class");
+}
+
+#[test]
+fn test_detector_can_switch_with_dual_gpu() {
+    let root = TestRoot::new();
+
+    // 模拟笔记本 chassis type（10 = 笔记本）
+    let dmi_path = root.path().join("sys/class/dmi/id");
+    fs::create_dir_all(&dmi_path).expect("create dmi dir");
+    fs::write(dmi_path.join("chassis_type"), "10\n").expect("write chassis_type");
+
+    // 模拟双 GPU：Intel IGD + NVIDIA dGPU
+    create_sysfs_pci_device(&root, "0000:00:02.0", "0x8086", "0x9bc4", "0x030000");
+    create_sysfs_pci_device(&root, "0000:01:00.0", "0x10de", "0x1f08", "0x030000");
+
+    assert!(gswitch::detector::Detector::can_switch().expect("can_switch"));
+}
+
+#[test]
+fn test_detector_can_switch_desktop_rejected() {
+    let root = TestRoot::new();
+
+    // 模拟台式机 chassis type（3 = Desktop）
+    let dmi_path = root.path().join("sys/class/dmi/id");
+    fs::create_dir_all(&dmi_path).expect("create dmi dir");
+    fs::write(dmi_path.join("chassis_type"), "3\n").expect("write chassis_type");
+
+    // 即使有双 GPU 也返回 false
+    create_sysfs_pci_device(&root, "0000:00:02.0", "0x8086", "0x9bc4", "0x030000");
+    create_sysfs_pci_device(&root, "0000:01:00.0", "0x10de", "0x1f08", "0x030000");
+
+    assert!(!gswitch::detector::Detector::can_switch().expect("can_switch"));
+}
+
+#[test]
+fn test_detector_can_switch_nvidia_removed_but_cache_exists() {
+    let root = TestRoot::new();
+
+    // 模拟笔记本 chassis type
+    let dmi_path = root.path().join("sys/class/dmi/id");
+    fs::create_dir_all(&dmi_path).expect("create dmi dir");
+    fs::write(dmi_path.join("chassis_type"), "10\n").expect("write chassis_type");
+
+    // 只有 Intel IGD（NVIDIA 已被 udev 移除）
+    create_sysfs_pci_device(&root, "0000:00:02.0", "0x8086", "0x9bc4", "0x030000");
+
+    // 但缓存存在
+    let cache_dir = root.path().join("var/cache/gswitch");
+    fs::create_dir_all(&cache_dir).expect("create cache dir");
+    fs::write(
+        cache_dir.join("gpu-cache.json"),
+        r#"{"version":1,"nvidia_gpu_pci_bus":"PCI:1:0:0"}"#,
+    )
+    .expect("write cache");
+
+    assert!(gswitch::detector::Detector::can_switch().expect("can_switch"));
+}
+
+#[test]
+fn test_detector_query_current_mode_nvidia() {
+    let root = TestRoot::new();
+
+    // 模拟 /proc/modules（nvidia 模块已加载）
+    let proc_path = root.path().join("proc");
+    fs::create_dir_all(&proc_path).expect("create proc dir");
+    fs::write(
+        proc_path.join("modules"),
+        "nvidia 12345678 0 - Live 0x0000000000000000\n",
+    )
+    .expect("write modules");
+
+    // 模拟 /etc/prime-discrete
+    let etc_path = root.path().join("etc");
+    fs::create_dir_all(&etc_path).expect("create etc dir");
+    fs::write(etc_path.join("prime-discrete"), "on\n").expect("write prime-discrete");
+
+    assert_eq!(
+        gswitch::detector::Detector::query_current_mode(),
+        gswitch::graphics::GraphicsMode::Nvidia
+    );
+}
+
+#[test]
+fn test_detector_query_current_mode_hybrid() {
+    let root = TestRoot::new();
+
+    // 模拟 /proc/modules（nvidia 模块已加载）
+    let proc_path = root.path().join("proc");
+    fs::create_dir_all(&proc_path).expect("create proc dir");
+    fs::write(
+        proc_path.join("modules"),
+        "nvidia_drm 12345678 0 - Live 0x0000000000000000\n",
+    )
+    .expect("write modules");
+
+    // 模拟 /etc/prime-discrete（on-demand = 混合模式）
+    let etc_path = root.path().join("etc");
+    fs::create_dir_all(&etc_path).expect("create etc dir");
+    fs::write(etc_path.join("prime-discrete"), "on-demand\n").expect("write prime-discrete");
+
+    assert_eq!(
+        gswitch::detector::Detector::query_current_mode(),
+        gswitch::graphics::GraphicsMode::Hybrid
+    );
+}
+
+#[test]
+fn test_detector_query_current_mode_integrated() {
+    let root = TestRoot::new();
+
+    // /proc/modules 中没有 nvidia 模块
+    let proc_path = root.path().join("proc");
+    fs::create_dir_all(&proc_path).expect("create proc dir");
+    fs::write(proc_path.join("modules"), "intel_lpss_pci 12345 0 - Live 0x...\n")
+        .expect("write modules");
+
+    assert_eq!(
+        gswitch::detector::Detector::query_current_mode(),
+        gswitch::graphics::GraphicsMode::Integrated
+    );
+}
+
+#[test]
+fn test_detector_external_display_requires_nvidia() {
+    let root = TestRoot::new();
+
+    // 模拟笔记本 chassis
+    let dmi_path = root.path().join("sys/class/dmi/id");
+    fs::create_dir_all(&dmi_path).expect("create dmi dir");
+    fs::write(dmi_path.join("chassis_type"), "10\n").expect("write chassis_type");
+
+    // 双 GPU
+    create_sysfs_pci_device(&root, "0000:00:02.0", "0x8086", "0x9bc4", "0x030000");
+    create_sysfs_pci_device(&root, "0000:01:00.0", "0x10de", "0x1f08", "0x030000");
+
+    // 模拟机型为 oryp8（EXTERNAL_DISPLAY_REQUIRES_NVIDIA 列表中的机型）
+    fs::write(dmi_path.join("product_version"), "oryp8\n").expect("write product_version");
+
+    assert!(
+        gswitch::detector::Detector::external_display_requires_nvidia()
+            .expect("external_display_requires_nvidia")
+    );
+}
+
+#[test]
+fn test_detector_external_display_not_required() {
+    let root = TestRoot::new();
+
+    let dmi_path = root.path().join("sys/class/dmi/id");
+    fs::create_dir_all(&dmi_path).expect("create dmi dir");
+    fs::write(dmi_path.join("chassis_type"), "10\n").expect("write chassis_type");
+
+    create_sysfs_pci_device(&root, "0000:00:02.0", "0x8086", "0x9bc4", "0x030000");
+    create_sysfs_pci_device(&root, "0000:01:00.0", "0x10de", "0x1f08", "0x030000");
+
+    // 模拟机型不在列表中
+    fs::write(dmi_path.join("product_version"), "unknown-model\n").expect("write product_version");
+
+    assert!(
+        !gswitch::detector::Detector::external_display_requires_nvidia()
+            .expect("external_display_requires_nvidia")
+    );
+}
+
+#[test]
+fn test_detector_get_default_nvidia_model() {
+    let root = TestRoot::new();
+
+    let dmi_path = root.path().join("sys/class/dmi/id");
+    fs::create_dir_all(&dmi_path).expect("create dmi dir");
+    fs::write(dmi_path.join("chassis_type"), "10\n").expect("write chassis_type");
+
+    // bonw16 是 DEFAULT_DISCRETE_MODELS 中的机型
+    fs::write(dmi_path.join("product_version"), "bonw16\n").expect("write product_version");
+
+    create_sysfs_pci_device(&root, "0000:00:02.0", "0x8086", "0x9bc4", "0x030000");
+    create_sysfs_pci_device(&root, "0000:01:00.0", "0x10de", "0x1f08", "0x030000");
+
+    assert_eq!(
+        gswitch::detector::Detector::get_default().expect("get_default"),
+        gswitch::graphics::GraphicsMode::Nvidia
+    );
+}

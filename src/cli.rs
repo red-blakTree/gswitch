@@ -69,6 +69,16 @@ pub enum PowerActionArg {
     Auto,
 }
 
+impl From<PowerActionArg> for PowerAction {
+    fn from(arg: PowerActionArg) -> Self {
+        match arg {
+            PowerActionArg::On => PowerAction::On,
+            PowerActionArg::Off => PowerAction::Off,
+            PowerActionArg::Auto => PowerAction::Auto,
+        }
+    }
+}
+
 impl Cli {
     pub fn run(&self) -> Result<(), GswitchError> {
         match &self.command {
@@ -119,17 +129,9 @@ impl Cli {
                 Ok(())
             }
             Command::Power { action } => match action {
-                Some(PowerActionArg::On) => {
+                Some(action) => {
                     Self::ensure_root()?;
-                    GpuController::power(PowerAction::On)
-                }
-                Some(PowerActionArg::Off) => {
-                    Self::ensure_root()?;
-                    GpuController::power(PowerAction::Off)
-                }
-                Some(PowerActionArg::Auto) => {
-                    Self::ensure_root()?;
-                    GpuController::power(PowerAction::Auto)
+                    GpuController::power(PowerAction::from(*action))
                 }
                 None => {
                     if GpuController::query_power() {

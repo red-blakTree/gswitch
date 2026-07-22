@@ -443,6 +443,7 @@ fn find_nvidia_smi() -> Option<String> {
     }
     // 备选 ABSOLUTE 路径（容器 / 非标准环境）
     for p in &[
+        "/usr/bin/nvidia-smi",
         "/usr/local/bin/nvidia-smi",
         "/usr/local/sbin/nvidia-smi",
     ] {
