@@ -86,6 +86,9 @@ jobs:
       - name: Install cargo-generate-rpm
         run: cargo install cargo-generate-rpm --locked
 
+      - name: Build release binary
+        run: cargo build --release
+
       - name: Build .rpm package
         run: cargo generate-rpm
 
