@@ -6,19 +6,30 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use std::fs;
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
+
+/// NVIDIA 设备 ID（vendor + device），用于 GPU PCIe 断电后恢复 vfio-pci 绑定信息
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct NvidiaDeviceId {
+    pub vendor: u16,
+    pub device: u16,
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct CacheData {
     version: u32,
     pub nvidia_gpu_pci_bus: String,
+    /// 所有 NVIDIA PCI 设备的 (vendor, device) 对，用于直通模式恢复
+    #[serde(default)]
+    pub nvidia_device_ids: Vec<NvidiaDeviceId>,
 }
 
 impl CacheData {
-    pub fn new(nvidia_gpu_pci_bus: String) -> Self {
+    pub fn new(nvidia_gpu_pci_bus: String, device_ids: Vec<NvidiaDeviceId>) -> Self {
         Self {
             version: CACHE_VERSION,
             nvidia_gpu_pci_bus,
+            nvidia_device_ids: device_ids,
         }
     }
 }

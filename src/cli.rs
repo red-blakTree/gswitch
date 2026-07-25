@@ -35,8 +35,12 @@ pub enum Command {
         #[arg(long, help = "RTD3 电源管理级别 [0-3]", value_parser = clap::value_parser!(u32).range(0..=3))]
         rtd3: Option<u32>,
     },
-    /// NVIDIA 独立显卡模式（高性能）
-    Nvidia,
+    Nvidia {
+        #[arg(long, help = "启用 ForceCompositionPipeline（修复画面撕裂）")]
+        force_comp: bool,
+        #[arg(long, help = "Coolbits 位掩码值 [0-31]（超频/风扇控制）")]
+        coolbits: Option<u8>,
+    },
     /// 查询当前显卡模式
     Query,
     /// 检查系统是否支持显卡切换
@@ -104,15 +108,20 @@ impl Cli {
                     mode: GraphicsMode::Hybrid,
                     nvidia_opts: NvidiaOptions {
                         rtd3: *rtd3,
+                        ..NvidiaOptions::default()
                     },
                 };
                 GpuController::switch_mode(opts)
             }
-            Command::Nvidia => {
+            Command::Nvidia { force_comp, coolbits } => {
                 Self::ensure_root()?;
                 let opts = SwitchOptions {
                     mode: GraphicsMode::Nvidia,
-                    nvidia_opts: NvidiaOptions::default(),
+                    nvidia_opts: NvidiaOptions {
+                        force_comp: *force_comp,
+                        coolbits: *coolbits,
+                        ..NvidiaOptions::default()
+                    },
                 };
                 GpuController::switch_mode(opts)
             }

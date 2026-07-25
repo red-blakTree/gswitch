@@ -93,7 +93,20 @@ impl Detector {
     }
 
     /// 检测所有 GPU 设备（仅显示控制器 class 0x03xxxx）
+    ///
+    /// 检测前先触发 PCI bus rescan，确保在 integrated 模式（GPU 已被 udev 移除）
+    /// 下也能重新发现 NVIDIA 设备。参考 system76-power Graphics::new() 的做法。
     fn detect_all() -> Result<DetectedGpus, GswitchError> {
+        // PCI bus rescan：重新枚举设备，恢复被 udev 移除的 GPU
+        let rescan_path = config::resolve_path("/sys/bus/pci/rescan");
+        if Path::new(&rescan_path).exists() {
+            if let Err(e) = fs::write(&rescan_path, "1") {
+                debug!("PCI rescan 失败（非致命）: {}", e);
+            } else {
+                debug!("PCI bus rescan 完成");
+            }
+        }
+
         let entries = Self::list_pci_entries()?;
 
         let mut nvidia = Vec::new();
@@ -190,14 +203,16 @@ impl Detector {
         let has_integrated_config =
             Path::new(&modprobe_path).exists() && Path::new(&integrated_path).exists();
 
-        let modeset_path = crate::config::resolve_path(MODESET_PATH);
-        let has_modeset = Path::new(&modeset_path).exists();
-
         let gswitch_content = fs::read_to_string(&modprobe_path).unwrap_or_default();
         // 排除注释行，仅匹配非注释行中的 vfio-pci 绑定
         let is_passthrough = gswitch_content
             .lines()
             .any(|line| !line.trim().starts_with('#') && line.contains("options vfio-pci"));
+
+        // modeset 已合并到 MODPROBE_GPU_PATH，检查内容而非旧 MODESET_PATH
+        let has_modeset = gswitch_content
+            .lines()
+            .any(|line| !line.trim().starts_with('#') && line.contains("modeset=1"));
 
         // 优先检测直通模式
         if is_passthrough {
@@ -253,6 +268,16 @@ impl Detector {
 
     /// 获取所有 NVIDIA PCI 设备的 (vendor_id, device_id) 对（所有功能号，不限于显示控制器）
     pub fn get_all_nvidia_ids() -> Result<Vec<(u16, u16)>, GswitchError> {
+        // PCI bus rescan：重新枚举设备，确保 integrated 模式（udev 已移除）下也能发现 NVIDIA
+        let rescan_path = config::resolve_path("/sys/bus/pci/rescan");
+        if Path::new(&rescan_path).exists() {
+            if let Err(e) = fs::write(&rescan_path, "1") {
+                debug!("PCI rescan 失败（非致命）: {}", e);
+            } else {
+                debug!("get_all_nvidia_ids: PCI bus rescan 完成");
+            }
+        }
+
         let entries = Self::list_pci_entries()?;
 
         let mut ids = Vec::new();

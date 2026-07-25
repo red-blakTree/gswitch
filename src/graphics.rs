@@ -45,6 +45,10 @@ impl std::str::FromStr for GraphicsMode {
 #[derive(Debug, Clone, Default)]
 pub struct NvidiaOptions {
     pub rtd3: Option<u32>,
+    /// NVIDIA 模式的 Coolbits 位掩码（None = 不启用）
+    pub coolbits: Option<u8>,
+    /// NVIDIA 模式是否启用 ForceCompositionPipeline
+    pub force_comp: bool,
 }
 
 /// 模式切换选项
@@ -141,10 +145,10 @@ impl GpuController {
         helper::cleanup()?;
 
         match opts.mode {
+            GraphicsMode::Hybrid => Self::switch_hybrid(opts.nvidia_opts.rtd3)?,
             GraphicsMode::Integrated => Self::switch_integrated()?,
             GraphicsMode::Passthrough => Self::switch_passthrough()?,
-            GraphicsMode::Hybrid => Self::switch_hybrid(opts.nvidia_opts.rtd3)?,
-            GraphicsMode::Nvidia => Self::switch_nvidia()?,
+            GraphicsMode::Nvidia => Self::switch_nvidia(&opts.nvidia_opts)?,
         }
 
         // 写入 PRIME 独立显卡模式标志
@@ -152,9 +156,9 @@ impl GpuController {
         // on-demand: Hybrid 模式下 PRIME 按需卸载渲染
         // on: Nvidia 模式下始终使用独立显卡
         let prime_mode = match opts.mode {
-            GraphicsMode::Hybrid => "on-demand\n",
-            GraphicsMode::Nvidia => "on\n",
-            GraphicsMode::Passthrough | GraphicsMode::Integrated => "off\n",
+            GraphicsMode::Hybrid => "on-demand",
+            GraphicsMode::Nvidia => "on",
+            GraphicsMode::Passthrough | GraphicsMode::Integrated => "off",
         };
         helper::set_prime_discrete(prime_mode)?;
 
@@ -240,19 +244,30 @@ impl GpuController {
 
     // ====== 内部实现 ======
 
-    /// 写入 NVIDIA GPU 缓存：从 sysfs 检测 PCI 地址，或回退到已有缓存
+    /// 写入 NVIDIA GPU 缓存：从 sysfs 检测 PCI 地址和设备 ID，或回退到已有缓存
+    /// 在 GPU 仍然在线时调用（如 integrated 切换前），可捕获所有设备 ID 用于后续恢复
     fn write_nvidia_cache() -> Result<(), GswitchError> {
         match Detector::get_nvidia_pci_id() {
             Ok(raw) => {
                 let pci_bus = parse_pci_id(&raw)?;
-                GpuCache::write(&CacheData::new(pci_bus))
+                // GPU 在线时同时收集所有 NVIDIA 设备 ID（用于 PCIe 断电后恢复）
+                let device_ids: Vec<crate::cache::NvidiaDeviceId> =
+                    Detector::get_all_nvidia_ids()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(vendor, device)| crate::cache::NvidiaDeviceId { vendor, device })
+                        .collect();
+                GpuCache::write(&CacheData::new(pci_bus, device_ids))
             }
             Err(_) => {
                 let data = GpuCache::read().map_err(|_| {
                     GswitchError::Gpu("sysfs 中未找到 NVIDIA GPU 且无可用缓存".into())
                 })?;
-                info!("sysfs 中未找到 NVIDIA，重用缓存的 PCI 地址");
-                GpuCache::write(&CacheData::new(data.nvidia_gpu_pci_bus))
+                info!("sysfs 中未找到 NVIDIA，重用缓存的 PCI 地址和设备 ID");
+                GpuCache::write(&CacheData::new(
+                    data.nvidia_gpu_pci_bus,
+                    data.nvidia_device_ids,
+                ))
             }
         }
     }
@@ -262,13 +277,7 @@ impl GpuController {
             warn!("保存 NVIDIA PCI 缓存失败: {}", e);
         }
 
-        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", false) {
-            warn!("禁用 nvidia-persistenced 失败: {}", e);
-        }
-        helper::configure_nvidia_suspend_services(false);
-        if let Err(e) = helper::toggle_service("nvidia-fallback.service", false) {
-            warn!("禁用 nvidia-fallback 失败: {}", e);
-        }
+        helper::configure_gpu_services(false, false, false);
 
         helper::write_file(MODPROBE_GPU_PATH, MODPROBE_INTEGRATED)?;
         helper::write_file(UDEV_INTEGRATED_PATH, UDEV_INTEGRATED)?;
@@ -283,20 +292,34 @@ impl GpuController {
             warn!("保存 NVIDIA PCI 缓存失败: {}", e);
         }
 
-        // 2. 禁用 NVIDIA 相关服务
-        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", false) {
-            warn!("禁用 nvidia-persistenced 失败: {}", e);
-        }
-        helper::configure_nvidia_suspend_services(false);
-        if let Err(e) = helper::toggle_service("nvidia-fallback.service", false) {
-            warn!("禁用 nvidia-fallback 失败: {}", e);
-        }
+        // 2. 禁用 NVIDIA 相关服务 + 挂起服务
+        helper::configure_gpu_services(false, false, false);
 
         // 3. 获取所有 NVIDIA PCI 设备 ID 用于 vfio-pci 绑定
-        let nvidia_ids = Detector::get_all_nvidia_ids()?;
-        if nvidia_ids.is_empty() {
-            return Err(GswitchError::Gpu("未检测到 NVIDIA GPU 设备".into()));
-        }
+        //    如果 GPU PCIe 已断电（如从 integrated 模式切换过来），从缓存恢复
+        let nvidia_ids: Vec<(u16, u16)> = match Detector::get_all_nvidia_ids() {
+            Ok(ids) if !ids.is_empty() => ids,
+            _ => {
+                info!("sysfs 中未检测到 NVIDIA 设备（PCIe 可能已断电），从缓存恢复设备 ID");
+                let cache = GpuCache::read().map_err(|e| {
+                    GswitchError::Gpu(format!(
+                        "未检测到 NVIDIA GPU 设备且缓存不可用: {}",
+                        e
+                    ))
+                })?;
+                if cache.nvidia_device_ids.is_empty() {
+                    return Err(GswitchError::Gpu(
+                        "未检测到 NVIDIA GPU 设备且缓存中无设备 ID（请先切换到混合模式生成缓存）"
+                            .into(),
+                    ));
+                }
+                cache
+                    .nvidia_device_ids
+                    .into_iter()
+                    .map(|d| (d.vendor, d.device))
+                    .collect()
+            }
+        };
 
         // 4. 生成 modprobe 配置：黑名单 NVIDIA 驱动 + 绑定到 vfio-pci
         let ids_str: Vec<String> = nvidia_ids
@@ -331,17 +354,11 @@ options vfio-pci ids={}
     }
 
     fn switch_hybrid(rtd3: Option<u32>) -> Result<(), GswitchError> {
-        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", true) {
-            warn!("启用 nvidia-persistenced 失败: {}", e);
-        }
-        if let Err(e) = helper::toggle_service("nvidia-fallback.service", false) {
-            warn!("禁用 nvidia-fallback 失败: {}", e);
-        }
+        helper::configure_gpu_services(true, false, true);
 
-        helper::write_file(MODPROBE_GPU_PATH, MODPROBE_EMPTY)?;
-
+        // modeset 配置与 modprobe 合并写入同一个文件（参考 system76-power）
         let modeset_content = generate_modeset_content(rtd3);
-        helper::write_file(MODESET_PATH, &modeset_content)?;
+        helper::write_file(MODPROBE_GPU_PATH, &modeset_content)?;
 
         helper::write_file(UDEV_PM_PATH, UDEV_PM_CONTENT)?;
         if let Err(e) = Self::write_nvidia_cache() {
@@ -350,31 +367,31 @@ options vfio-pci ids={}
         Ok(())
     }
 
-    fn switch_nvidia() -> Result<(), GswitchError> {
+    fn switch_nvidia(opts: &NvidiaOptions) -> Result<(), GswitchError> {
         if let Err(e) = Self::write_nvidia_cache() {
             warn!("保存 NVIDIA PCI 缓存失败: {}", e);
         }
 
-        if let Err(e) = helper::toggle_service("nvidia-persistenced.service", true) {
-            warn!("启用 nvidia-persistenced 失败: {}", e);
-        }
+        helper::configure_gpu_services(true, true, true);
 
-        helper::write_file(MODPROBE_GPU_PATH, MODPROBE_EMPTY)?;
-        helper::write_file(MODESET_PATH, MODESET_CONTENT)?;
-
+        // modeset 配置与 modprobe 合并写入同一个文件（参考 system76-power）
+        helper::write_file(MODPROBE_GPU_PATH, MODESET_CONTENT)?;
         helper::write_xorg_nvidia_config()?;
         helper::write_nvidia_env_config()?;
 
-        if let Err(e) = helper::toggle_service("nvidia-fallback.service", true) {
-            warn!("启用 nvidia-fallback 失败: {}", e);
-        }
+        // 额外 Xorg 选项: ForceCompositionPipeline / Coolbits
+        helper::write_xorg_nvidia_extra_config(opts)?;
+
+        // Display Manager 适配: SDDM / LightDM 的 xrandr 桥接脚本
+        helper::write_dm_scripts()?;
+
 
         Ok(())
     }
 }
 
 /// 生成 modeset 配置内容，支持可选的 RTD3 参数
-fn generate_modeset_content(rtd3: Option<u32>) -> String {
+pub(crate) fn generate_modeset_content(rtd3: Option<u32>) -> String {
     if let Some(rtd3_val) = rtd3 {
         // CLI 已校验范围为 0-3，此处为程序化调用的安全截断
         let clamped = if rtd3_val > 3 {

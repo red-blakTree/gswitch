@@ -52,7 +52,10 @@ fn atomic_write(path: &str, content: &[u8], executable: bool) -> Result<(), Gswi
     }
 
     fs::rename(&tmp, &resolved)
-        .map_err(|e| GswitchError::Gpu(format!("rename to {} failed: {}", resolved, e)))?;
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp);
+            GswitchError::Gpu(format!("rename to {} failed: {}", resolved, e))
+        })?;
 
     debug!("文件已写入: {}", resolved);
     Ok(())
@@ -61,6 +64,10 @@ fn atomic_write(path: &str, content: &[u8], executable: bool) -> Result<(), Gswi
 /// 原子写入文本文件
 pub fn write_file(path: &str, content: &str) -> Result<(), GswitchError> {
     atomic_write(path, content.as_bytes(), false)
+}
+/// 原子写入可执行文件（0o755）
+pub fn write_executable_file(path: &str, content: &str) -> Result<(), GswitchError> {
+    atomic_write(path, content.as_bytes(), true)
 }
 
 /// 删除文件，忽略 NotFound 错误
@@ -107,8 +114,11 @@ pub fn cleanup() -> Result<(), GswitchError> {
         NV_ENV_PATH,
         XORG_CONF_NVIDIA_PATH,
         XORG_CONF_NVIDIA_FALLBACK_PATH,
+        EXTRA_XORG_NVIDIA_PATH,
         DRACUT_VFIO_CONF_PATH,
         MKINITCPIO_VFIO_CONF_PATH,
+        LIGHTDM_SCRIPT_PATH,
+        LIGHTDM_CONFIG_PATH,
     ] {
         if let Err(e) = remove_file(path) {
             errors.push(e.to_string());
@@ -116,6 +126,18 @@ pub fn cleanup() -> Result<(), GswitchError> {
     }
     if let Err(e) = remove_vfio_from_initramfs_modules() {
         errors.push(e.to_string());
+    }
+
+    // 还原 SDDM Xsetup 备份（如果存在）
+    let xsetup_bak = crate::config::resolve_path(SDDM_XSETUP_BAK_PATH);
+    if Path::new(&xsetup_bak).exists() {
+        if let Ok(backup_content) = read_file(SDDM_XSETUP_BAK_PATH) {
+            if let Err(e) = write_file(SDDM_XSETUP_PATH, &backup_content) {
+                errors.push(format!("还原 SDDM Xsetup 失败: {}", e));
+            } else {
+                let _ = std::fs::remove_file(&xsetup_bak);
+            }
+        }
     }
 
     if !errors.is_empty() {
@@ -228,7 +250,7 @@ pub fn rebuild_initramfs() -> Result<(), GswitchError> {
         || Path::new("/sbin/update-initramfs").exists()
     {
         info!("检测到 update-initramfs");
-        let status = run_status("update-initramfs", ["-u"])?;
+        let status = run_status("update-initramfs", ["-u", "-k", "all"])?;
         return ensure_success(status);
     }
 
@@ -276,7 +298,89 @@ pub fn get_xorg_conf_path() -> &'static str {
 pub fn write_xorg_nvidia_config() -> Result<(), GswitchError> {
     let path = get_xorg_conf_path();
     info!("正在写入 X11 配置: {}", path);
-    write_file(path, crate::config::XORG_CONF_NVIDIA_CONTENT)
+    write_file(path, crate::config::XORG_CONF_NVIDIA_CONTENT)}
+
+/// 写入 NVIDIA 额外 Xorg 配置（ForceCompositionPipeline / Coolbits）
+///
+/// 仅在至少一个选项启用时写入。参考 envycontrol 的 EXTRA_XORG_PATH 逻辑。
+pub fn write_xorg_nvidia_extra_config(opts: &crate::graphics::NvidiaOptions) -> Result<(), GswitchError> {
+    use crate::config::*;
+    if opts.force_comp || opts.coolbits.is_some() {
+        info!("正在写入 NVIDIA 额外 Xorg 配置 (force_comp={}, coolbits={:?})",
+              opts.force_comp, opts.coolbits);
+        let mut content = String::from(EXTRA_XORG_HEADER);
+        if opts.force_comp {
+            content.push_str(EXTRA_XORG_FORCE_COMP);
+        }
+        if let Some(cb) = opts.coolbits {
+            content.push_str(&EXTRA_XORG_COOLBITS.replacen("{}", &cb.to_string(), 1));
+        }
+        content.push_str(EXTRA_XORG_FOOTER);
+        write_file(EXTRA_XORG_NVIDIA_PATH, &content)
+    } else {
+        Ok(())
+    }
+}
+
+/// 写入 Display Manager xrandr 桥接脚本（SDDM / LightDM）
+///
+/// 在没有 MUX 切换器的笔记本上，外接显示器的物理端口连接到 NVIDIA GPU。
+/// 需要在 DM 启动时通过 xrandr 将 iGPU 的输出桥接到 NVIDIA，
+/// 否则外接显示器无信号。参考 envycontrol 的 SDDM/LightDM 适配逻辑。
+pub fn write_dm_scripts() -> Result<(), GswitchError> {
+    use crate::config::*;
+
+    // 检测 iGPU provider 名称
+    let igpu_provider = detect_igpu_xrandr_provider();
+    let script = XRANDR_BRIDGE_SCRIPT.replacen("{}", &igpu_provider, 1);
+
+    // SDDM
+    if file_exists(SDDM_XSETUP_PATH) {
+        info!("检测到 SDDM，写入 xrandr 桥接脚本");
+        // 备份原 Xsetup
+        if let Ok(existing) = read_file(SDDM_XSETUP_PATH) {
+            let _ = write_file(SDDM_XSETUP_BAK_PATH, &existing);
+        }
+        // 使用原子写入 + 可执行权限（0o755），无需外部 chmod
+        write_executable_file(SDDM_XSETUP_PATH, &script)?;
+    }
+
+    // LightDM
+    if file_exists("/etc/lightdm") {
+        info!("检测到 LightDM，写入 xrandr 桥接脚本");
+        write_executable_file(LIGHTDM_SCRIPT_PATH, &script)?;
+        write_file(LIGHTDM_CONFIG_PATH, LIGHTDM_CONFIG_CONTENT)?;
+    }
+
+    Ok(())
+}
+
+/// 检测 iGPU 的 xrandr provider 名称
+///
+/// 对 Intel iGPU 返回 "modesetting"（现代驱动），对 AMD iGPU 尝试通过
+/// `xrandr --listproviders` 获取实际输出名，失败时回退到 "modesetting"。
+fn detect_igpu_xrandr_provider() -> String {
+    if let Ok(output) = std::process::Command::new("xrandr")
+        .args(["--listproviders"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // 查找非 NVIDIA 的 provider（通常是 AMD 或 Intel）
+        for line in stdout.lines() {
+            if line.contains("name:") && !line.contains("NVIDIA") {
+                // 提取 "name:XXX" 后的名称
+                if let Some(name_part) = line.split("name:").nth(1) {
+                    let name = name_part.trim();
+                    if !name.is_empty() {
+                        debug!("检测到 iGPU xrandr provider: {}", name);
+                        return name.to_string();
+                    }
+                }
+            }
+        }
+    }
+    // 默认：Intel 用 modesetting，AMD 也兼容 modesetting
+    "modesetting".to_string()
 }
 
 /// 写入 NVIDIA 环境变量配置（独立显卡模式）
@@ -333,10 +437,35 @@ pub fn configure_nvidia_suspend_services(enable: bool) {
     }
 }
 
+/// 统一配置 NVIDIA GPU 相关 systemd 服务（消除 switch_* 中的重复代码）
+///
+/// - `persistenced`: nvidia-persistenced.service（保持 GPU 设备可用）
+/// - `fallback`: nvidia-fallback.service（启动早期加载 NVIDIA 驱动）
+/// - `suspend`: NVIDIA 挂起/休眠服务（nvidia-hibernate/resume/suspend）
+pub fn configure_gpu_services(persistenced: bool, fallback: bool, suspend: bool) {
+    let mut errors: Vec<String> = Vec::new();
+    if let Err(e) = toggle_service("nvidia-persistenced.service", persistenced) {
+        errors.push(format!("nvidia-persistenced: {}", e));
+    }
+    if let Err(e) = toggle_service("nvidia-fallback.service", fallback) {
+        errors.push(format!("nvidia-fallback: {}", e));
+    }
+    for svc in crate::config::NVIDIA_SUSPEND_SERVICES {
+        if suspend {
+            if let Err(e) = toggle_service(svc, true) {
+                errors.push(format!("{}: {}", svc, e));
+            }
+        }
+    }
+    if !errors.is_empty() {
+        warn!("GPU 服务配置失败: {}", errors.join("; "));
+    }
+}
+
 /// 写入 PRIME 独立显卡模式标志文件
 pub fn set_prime_discrete(mode: &str) -> Result<(), GswitchError> {
-    info!("正在设置 PRIME 独立显卡模式: {}", mode.trim());
-    write_file(crate::config::PRIME_DISCRETE_PATH, mode)
+    info!("正在设置 PRIME 独立显卡模式: {}", mode);
+    write_file(crate::config::PRIME_DISCRETE_PATH, &format!("{}\n", mode))
 }
 
 /// 在 modprobe 文件中追加挂起电源管理配置
@@ -571,7 +700,7 @@ pub fn runtime_power_off() -> Result<(), GswitchError> {
         }
     }
 
-    // 解绑阶段出错 → 尝试重新绑定已解绑设备
+    // 解绑阶段出错 → 尝试重新绑定已解绑设备 + PCI rescan
     if !errors.is_empty() {
         warn!("解绑过程出现错误，尝试恢复已解绑设备...");
         let mut rebind_failures: Vec<String> = Vec::new();
@@ -583,13 +712,20 @@ pub fn runtime_power_off() -> Result<(), GswitchError> {
                 rebind_failures.push(msg);
             }
         }
+        // 额外尝试 PCI rescan 恢复设备
+        if let Err(e) = fs::write("/sys/bus/pci/rescan", "1") {
+            warn!("PCI rescan 恢复失败: {}", e);
+        }
         if !rebind_failures.is_empty() {
             log::error!(
                 "部分设备重绑定失败！请手动检查 lspci 状态:\n{}",
                 rebind_failures.join("\n")
             );
         }
-        return Err(GswitchError::Gpu(errors.join("; ")));
+        return Err(GswitchError::Gpu(format!(
+            "解绑阶段失败: {} (已尝试恢复)",
+            errors.join("; ")
+        )));
     }
 
     // 移除所有功能号（从高到低）
@@ -604,9 +740,12 @@ pub fn runtime_power_off() -> Result<(), GswitchError> {
     if !errors.is_empty() {
         warn!("移除过程出现错误，尝试 rescan 恢复设备...");
         if let Err(e) = fs::write("/sys/bus/pci/rescan", "1") {
-            warn!("PCI rescan 失败: {}", e);
+            warn!("PCI rescan 恢复失败: {}", e);
         }
-        return Err(GswitchError::Gpu(errors.join("; ")));
+        return Err(GswitchError::Gpu(format!(
+            "移除阶段失败: {} (已尝试 PCI rescan 恢复)",
+            errors.join("; ")
+        )));
     }
 
     Ok(())
